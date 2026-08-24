@@ -379,8 +379,10 @@ static void Screen_GetWindowBounds(SDL_Rect* r) {
 		int top, left, bottom, right;
 		float hscale, wscale;
 		if (SDL_GetWindowBordersSize(sdlWindow, &top, &left, &bottom, &right) == false) {
-			top = bottom = 50;
-			left = right = 25;
+			/* No window manager: the window really has no decorations,
+			 * so do not shrink the emulated screen to make room for
+			 * imaginary ones (kernel-hive bridge kiosk). */
+			top = bottom = left = right = 0;
 		} else if (!ConfigureParams.Screen.bShowStatusbar) {
 			bottom += 24; /* make sure there is enough space to show statusbar */
 		}
