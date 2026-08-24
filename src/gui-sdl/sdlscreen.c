@@ -81,6 +81,271 @@ static uint32_t col2rgb(SDL_Surface* surf, int col) {
 /*
  BW format is 2 bit per pixel
  */
+
+/* ---- Kernel Hive: IFB1 shm framebuffer export (PREVIOUS_SHM_PATH) ---------
+ *
+ * Publish each finished frame into a file-backed mapping so the streamhost
+ * daemon can capture the emulated screen with no X server and no window (SDL
+ * dummy video driver). Wire format and the reader's contract:
+ * streamhost/streamhost/src/capture/shm.rs — 64-byte header, seqlock in the
+ * u64 at offset 24 (ODD while pixels are being written, EVEN when stable),
+ * dirty rect at 32..48, XRGB8888 pixels from 64. Inert unless the env is set.
+ *
+ * WHY NOT PUBLISH EVERY REPAINT. Previous repaints on its own cadence whether
+ * or not the NeXT framebuffer moved, and a 1120x832 frame is 3.73 MB: at 60 Hz
+ * an unconditional publish is ~224 MB/s of memcpy here, and every one of those
+ * frames also costs the reader a full copy plus (SH_SHM_DAMAGE=1) a full-frame
+ * diff, because the reader skips a frame only on an unchanged seqlock or an
+ * empty dirty rect. Measured on an idle NeXTSTEP 3.3 Workspace: about 94% of
+ * repaints carry no change at all. So:
+ *
+ *   pass 1  row-wise memcmp of the blitted frame against a PRIVATE shadow ->
+ *           the changed row span, and within it a pixel-precise x span
+ *           (forward/backward word scan, which early-exits on the first
+ *           difference).
+ *   pass 2  ONLY IF something changed: seq -> odd, copy the dirty region into
+ *           both the mapping and the shadow, write the real dirty rect,
+ *           seq -> even.
+ *
+ * An unchanged repaint never touches the seqlock, so the reader never wakes
+ * for it. PREVIOUS_SHM_STATS=1 prints the counters; PREVIOUS_SHM_FULL=1
+ * disables the diff entirely and publishes every repaint whole, which is the
+ * control for "is this artefact the guest's or mine?" — the question a
+ * damage-tracking producer must always be able to answer.
+ *
+ * THE DIFF MUST RUN ON THE PIXELS BEING PUBLISHED, NOT ON THE SOURCE. Diffing
+ * the guest's own 2 bpp video memory instead is 16x less memory to touch and
+ * measured 15x faster (59 us against 880 us per repaint) — and it is WRONG, in
+ * a way that takes a control run to see. The blit reads NEXTVideo on the
+ * rendering thread while the 68k keeps writing it, so a row that changes
+ * between the blit and the diff is recorded into the shadow with its NEW
+ * source bytes while the mapping receives the OLD pixels. Every later repaint
+ * then finds that row "unchanged" and the mapping keeps the stale pixels
+ * indefinitely. Observed as permanent bands of smeared window texture on the
+ * desktop, absent under PREVIOUS_SHM_FULL=1 with the identical scene. Diffing
+ * the blitted frame is self-consistent by construction: the bytes compared,
+ * the bytes shadowed and the bytes published are the same bytes.
+ *
+ * THE FIRST PUBLISH IS ALWAYS WHOLE. The mapping is freshly ftruncate'd, so
+ * every pixel in it is zero — which is not what a zero source row blits to.
+ * A row that never changes would otherwise never be written and would stay
+ * black for the life of the process.
+ *
+ * Because the rect is real, the integration should run streamhost with
+ * SH_SHM_DAMAGE=0: the host-side diff exists to recover a bbox from a producer
+ * that reports only whole-frame dirty, and repeating it there would be another
+ * full pass over pixels this side has already classified.
+ *
+ * SEQLOCK EXACTNESS. The sequence counter is kept in a LOCAL variable and only
+ * stored to the mapping, never read back from it: a reader cannot write it, but
+ * neither should the producer trust a word another process can map. Both stores
+ * are __ATOMIC_RELEASE, the odd store strictly precedes the first pixel write
+ * and the even store strictly follows the last — including the dirty rect,
+ * which the reader consumes as part of the frame.
+ *
+ * ONE PRODUCER. blitBW()/blitColor() run on the repaint thread only, so no lock
+ * is needed; the shadow buffer and the counters are owned by that thread. */
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <time.h>
+
+#define FBSHM_HEADER 64
+#define FBSHM_MAGIC  0x31424649u /* 'IFB1' little-endian */
+
+static uint8_t*  fbshm_map    = NULL;   /* the published mapping */
+static uint8_t*  fbshm_shadow = NULL;   /* private copy of the last publish */
+static uint64_t  fbshm_seq    = 0;      /* local seqlock counter, even = stable */
+static int       fbshm_state  = 0;      /* 0 = untried, 1 = live, -1 = off */
+static int       fbshm_w      = 0;
+static int       fbshm_h      = 0;
+static int       fbshm_stats  = 0;
+static int       fbshm_full   = 0;      /* PREVIOUS_SHM_FULL: never diff */
+static uint64_t  fbshm_pub    = 0;      /* frames published */
+static uint64_t  fbshm_skip   = 0;      /* repaints found unchanged */
+static uint64_t  fbshm_bytes  = 0;      /* pixel bytes copied */
+static uint64_t  fbshm_ns     = 0;      /* time in publish (both passes) */
+
+static uint64_t fbshm_now_ns(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* One-time setup: size the file at the emulated geometry, map it, write the
+ * header. Failure disables the export for the process rather than retrying per
+ * frame — a station whose mapping cannot be created has a launcher bug, and a
+ * retry loop in the repaint path would hide it behind a stutter. */
+static void fbshm_open(void) {
+	const char* path;
+	size_t sz;
+	int fd;
+
+	fbshm_state = -1;
+	path = SDL_getenv("PREVIOUS_SHM_PATH");
+	if (!path || !*path) {
+		return;
+	}
+	fbshm_w = NeXT_SCRN_W;
+	fbshm_h = NeXT_SCRN_H;
+	if (fbshm_w <= 0 || fbshm_h <= 0) {
+		fprintf(stderr, "fbshm: refusing to publish %dx%d\n", fbshm_w, fbshm_h);
+		return;
+	}
+	sz = FBSHM_HEADER + (size_t)fbshm_w * (size_t)fbshm_h * 4;
+	fd = open(path, O_RDWR | O_CREAT, 0644);
+	if (fd < 0) {
+		fprintf(stderr, "fbshm: open %s: %s\n", path, strerror(errno));
+		return;
+	}
+	if (ftruncate(fd, (off_t)sz) != 0) {
+		fprintf(stderr, "fbshm: ftruncate %s: %s\n", path, strerror(errno));
+		close(fd);
+		return;
+	}
+	fbshm_map = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (fbshm_map == MAP_FAILED) {
+		fbshm_map = NULL;
+		fprintf(stderr, "fbshm: mmap %s: %s\n", path, strerror(errno));
+		return;
+	}
+	fbshm_shadow = calloc((size_t)fbshm_w * (size_t)fbshm_h, 4);
+	if (!fbshm_shadow) {
+		munmap(fbshm_map, sz);
+		fbshm_map = NULL;
+		fprintf(stderr, "fbshm: out of memory for the %dx%d shadow\n", fbshm_w, fbshm_h);
+		return;
+	}
+	/* The header is written BEFORE any frame and never again; the reader
+	 * validates magic/version/bpp and sizes its own mapping from it. The
+	 * seqlock starts at 0 (even, no frame yet) and the dirty rect empty, which
+	 * the reader reads as "nothing to take". */
+	((uint32_t*)(void*)fbshm_map)[0] = FBSHM_MAGIC;
+	((uint32_t*)(void*)fbshm_map)[1] = 1;
+	((uint32_t*)(void*)fbshm_map)[2] = (uint32_t)fbshm_w;
+	((uint32_t*)(void*)fbshm_map)[3] = (uint32_t)fbshm_h;
+	((uint32_t*)(void*)fbshm_map)[4] = (uint32_t)fbshm_w * 4;
+	((uint32_t*)(void*)fbshm_map)[5] = 32;
+	fbshm_stats = SDL_getenv("PREVIOUS_SHM_STATS") != NULL;
+	fbshm_full  = SDL_getenv("PREVIOUS_SHM_FULL") != NULL;
+	fbshm_state = 1;
+	fprintf(stderr, "fbshm: publishing %dx%d to %s%s%s\n", fbshm_w, fbshm_h, path,
+	        fbshm_stats ? " (stats on)" : "", fbshm_full ? " (full frames)" : "");
+}
+
+/* PREVIOUS_SHM_STATS: the measurement that justifies the diff. Printed from
+ * BOTH the published and the skipped path — on an idle desktop almost every
+ * repaint is a skip, and a counter that only printed when something changed
+ * would never report the case it exists to measure. */
+static void fbshm_report(void) {
+	uint64_t n = fbshm_pub + fbshm_skip;
+
+	if (n == 0 || (n % 600) != 0) {
+		return;
+	}
+	fprintf(stderr, "fbshm: %llu repaints, %llu published, %llu unchanged, "
+	        "%llu MB copied, %llu ns/repaint\n",
+	        (unsigned long long)n, (unsigned long long)fbshm_pub,
+	        (unsigned long long)fbshm_skip,
+	        (unsigned long long)(fbshm_bytes >> 20),
+	        (unsigned long long)(fbshm_ns / n));
+}
+
+static void fbshm_publish(const void* pixels, int pitch) {
+	const uint8_t* src;
+	uint8_t*  dst;
+	uint32_t* dirty;
+	size_t    row;
+	uint64_t  t0 = 0;
+	int y, y0, y1, x0, x1;
+
+	if (fbshm_state == 0) {
+		fbshm_open();
+	}
+	if (fbshm_state != 1) {
+		return;
+	}
+	/* The geometry is baked into the mapping's size. NeXT_SCRN_W/H are const
+	 * for the process, so this can only fire if that ever stops being true —
+	 * in which case dropping the frame is right and a torn read is not. */
+	if (NeXT_SCRN_W != fbshm_w || NeXT_SCRN_H != fbshm_h) {
+		return;
+	}
+	if (fbshm_stats) {
+		t0 = fbshm_now_ns();
+	}
+
+	src = (const uint8_t*)pixels;
+	dst = fbshm_map + FBSHM_HEADER;
+	row = (size_t)fbshm_w * 4;
+
+	/* Pass 1: find the changed region. Reads only; nothing is published for a
+	 * frame that turns out to be identical to the last one. The first publish
+	 * of the process, and PREVIOUS_SHM_FULL, skip straight to a whole frame. */
+	y0 = fbshm_h;
+	y1 = -1;
+	x0 = fbshm_w;
+	x1 = -1;
+	if (fbshm_full || fbshm_pub == 0) {
+		y0 = 0; y1 = fbshm_h - 1;
+		x0 = 0; x1 = fbshm_w - 1;
+	} else {
+		for (y = 0; y < fbshm_h; y++) {
+			const uint32_t* s = (const uint32_t*)(const void*)(src + (size_t)y * pitch);
+			const uint32_t* p = (const uint32_t*)(const void*)(fbshm_shadow + (size_t)y * row);
+			int lo, hi;
+			if (memcmp(s, p, row) == 0) {
+				continue;
+			}
+			if (y < y0) y0 = y;
+			if (y > y1) y1 = y;
+			/* Narrow x only while it can still narrow: once the span is the
+			 * whole width these scans cannot improve it, so skip them. */
+			if (x0 == 0 && x1 == fbshm_w - 1) {
+				continue;
+			}
+			for (lo = 0; lo < fbshm_w && s[lo] == p[lo]; lo++) { }
+			for (hi = fbshm_w - 1; hi > lo && s[hi] == p[hi]; hi--) { }
+			if (lo < x0) x0 = lo;
+			if (hi > x1) x1 = hi;
+		}
+	}
+	if (y1 < 0) {
+		fbshm_skip++;
+		if (fbshm_stats) {
+			fbshm_ns += fbshm_now_ns() - t0;
+			fbshm_report();
+		}
+		return;
+	}
+
+	/* Pass 2: publish. Odd first, even last, both released, dirty rect inside
+	 * the critical section because the reader consumes it with the pixels. */
+	__atomic_store_n((uint64_t*)(void*)(fbshm_map + 24), ++fbshm_seq, __ATOMIC_RELEASE);
+	for (y = y0; y <= y1; y++) {
+		const uint8_t* s = src + (size_t)y * pitch + (size_t)x0 * 4;
+		size_t n = (size_t)(x1 - x0 + 1) * 4;
+		memcpy(dst + (size_t)y * row + (size_t)x0 * 4, s, n);
+		memcpy(fbshm_shadow + (size_t)y * row + (size_t)x0 * 4, s, n);
+		fbshm_bytes += n;
+	}
+	dirty = (uint32_t*)(void*)(fbshm_map + 32);
+	dirty[0] = (uint32_t)x0;
+	dirty[1] = (uint32_t)y0;
+	dirty[2] = (uint32_t)(x1 + 1); /* exclusive: the reader wants x1 > x0 */
+	dirty[3] = (uint32_t)(y1 + 1);
+	__atomic_store_n((uint64_t*)(void*)(fbshm_map + 24), ++fbshm_seq, __ATOMIC_RELEASE);
+
+	fbshm_pub++;
+	if (fbshm_stats) {
+		fbshm_ns += fbshm_now_ns() - t0;
+		fbshm_report();
+	}
+}
+/* ---- end Kernel Hive fbshm ---- */
+
 static void blitBW(SDL_Texture* tex) {
 	void* pixels;
 	uint8_t* src;
@@ -100,6 +365,7 @@ static void blitBW(SDL_Texture* tex) {
 		src += src_padding;
 		dst += dst_padding;
 	}
+	fbshm_publish(pixels, pitch);
 	SDL_UnlockTexture(tex);
 }
 
@@ -124,6 +390,7 @@ static void blitColor(SDL_Texture* tex) {
 		src += src_padding;
 		dst += dst_padding;
 	}
+	fbshm_publish(pixels, pitch);
 	SDL_UnlockTexture(tex);
 }
 
