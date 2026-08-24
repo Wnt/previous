@@ -14,6 +14,7 @@ const char Snd_fileid[] = "Previous snd.c";
 #include "cycInt.h"
 #include "audio.h"
 #include "grab.h"
+#include "sndfifo.h"
 #include "snd.h"
 #include "kms.h"
 #include "dsp.h"
@@ -208,6 +209,7 @@ static int snd_send_samples(uint8_t* buf, int len) {
     }
     snd_adjust_volume_and_deemphasis(buf, len);
     Grab_Sound(buf, len);
+    SndFifo_Write(buf, len);
     Audio_Output_Queue_Put(buf, len);
     return len;
 }

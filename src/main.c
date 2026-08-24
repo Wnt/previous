@@ -35,6 +35,7 @@ const char Main_fileid[] = "Previous main.c";
 #include "host.h"
 #include "grab.h"
 #include "ctlsock.h"
+#include "sndfifo.h"
 #include "dimension.hpp"
 
 #include "hatari-glue.h"
@@ -353,6 +354,7 @@ static bool Main_Init(void) {
 	/* Kernel Hive host-native planes. Started before the machine resets, so a
 	 * station's daemon can be connected and draining from the first frame. */
 	CtlSock_Init();
+	SndFifo_Init();
 
 	/* Call menu at startup */
 	if (Main_StartMenu()) {
@@ -369,6 +371,7 @@ static bool Main_Init(void) {
  */
 static void Main_UnInit(void) {
 	CtlSock_UnInit();
+	SndFifo_UnInit();
 #ifndef ENABLE_RENDERING_THREAD
 	/* Make sure emulator thread exits */
 	bEmulationActive = true;
