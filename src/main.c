@@ -34,6 +34,7 @@ const char Main_fileid[] = "Previous main.c";
 #include "dsp.h"
 #include "host.h"
 #include "grab.h"
+#include "ctlsock.h"
 #include "dimension.hpp"
 
 #include "hatari-glue.h"
@@ -244,6 +245,10 @@ void Main_EventHandler(void) {
 	GuiEvent_EventQueueHandler();
 #endif
 
+	/* Injected input rides the same 200 Hz poll, on the same (emulation)
+	 * thread, so the emulator core is never touched from the reader thread. */
+	CtlSock_Drain();
+
 	Timing_Sync();
 
 	CycInt_AddTimeEvent((1000*1000)/200, 0, EVENT_MAIN_EVENT); /* Poll events at 200 Hz */
@@ -345,6 +350,10 @@ static bool Main_Init(void) {
 	/* Done as last, needs CPU & DSP running... */
 	DebugUI_Init();
 
+	/* Kernel Hive host-native planes. Started before the machine resets, so a
+	 * station's daemon can be connected and draining from the first frame. */
+	CtlSock_Init();
+
 	/* Call menu at startup */
 	if (Main_StartMenu()) {
 		/* Reset emulated machine */
@@ -359,6 +368,7 @@ static bool Main_Init(void) {
  * Un-Initialise emulation
  */
 static void Main_UnInit(void) {
+	CtlSock_UnInit();
 #ifndef ENABLE_RENDERING_THREAD
 	/* Make sure emulator thread exits */
 	bEmulationActive = true;

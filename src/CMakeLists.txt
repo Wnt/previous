@@ -1,6 +1,6 @@
 
 set(SOURCES
-	adb.c bmap.c cfgopts.c configuration.c change.c cycInt.c dialog.c dma.c 
+	adb.c bmap.c cfgopts.c configuration.c change.c ctlsock.c cycInt.c dialog.c dma.c 
 	esp.c enet_slirp.c enet_pcap.c ethernet.c file.c floppy.c grab.c ioMem.c 
 	ioMemTabNEXT.c ioMemTabTurbo.c kms.c m68000.c main.c mo.c nbic.c ncc.c 
 	paths.c printer.c queue.c ramdac.c reset.c rom.c rs.c rtcnvram.c scandir.c 
