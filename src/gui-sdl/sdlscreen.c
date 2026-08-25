@@ -166,6 +166,28 @@ static uint64_t  fbshm_pub    = 0;      /* frames published */
 static uint64_t  fbshm_skip   = 0;      /* repaints found unchanged */
 static uint64_t  fbshm_bytes  = 0;      /* pixel bytes copied */
 static uint64_t  fbshm_ns     = 0;      /* time in publish (both passes) */
+static int       fbshm_resync = 0;      /* publish the next frame WHOLE */
+
+/* Force one whole-frame publish.
+ *
+ * The mapping is NOT part of a criu checkpoint -- criu never copies it, and a
+ * restored process comes back with the same inode at the same address. The
+ * private diff shadow IS part of the checkpoint. So after a restore the shadow
+ * holds the pixels of the moment the image was BAKED while the file holds
+ * whatever the process was showing when it was killed, and every subsequent
+ * repaint compares against the shadow, finds the frame unchanged and publishes
+ * NOTHING: the reader keeps streaming the pre-kill picture, forever, while the
+ * guest is demonstrably alive and its cursor moves. That is the shm cousin of
+ * the delete-and-re-create-fb.shm trap in
+ * scripts/build-guests/irix/irix-criu/README.md, and it passes every smoke test
+ * -- the emulator runs, the socket answers, the framebuffer has a valid header,
+ * and the picture is simply the wrong one.
+ *
+ * The restore path says FBSYNC over the control socket and this republishes the
+ * next repaint whole. Measured cost: one 3.7 MB copy. */
+void Screen_ShmResync(void) {
+	fbshm_resync = 1;
+}
 
 static uint64_t fbshm_now_ns(void) {
 	struct timespec ts;
@@ -288,7 +310,8 @@ static void fbshm_publish(const void* pixels, int pitch) {
 	y1 = -1;
 	x0 = fbshm_w;
 	x1 = -1;
-	if (fbshm_full || fbshm_pub == 0) {
+	if (fbshm_full || fbshm_pub == 0 || fbshm_resync) {
+		fbshm_resync = 0;
 		y0 = 0; y1 = fbshm_h - 1;
 		x0 = 0; x1 = fbshm_w - 1;
 	} else {

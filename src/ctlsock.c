@@ -34,6 +34,7 @@
       ->  <seq> DOWN1|UP1              left button
       ->  <seq> DOWN2|UP2              right button
       ->  <seq> DOWN3|UP3              middle - no such button on a NeXT, no-op
+      ->  <seq> FBSYNC                 republish the whole framebuffer once
       ->  <seq> NETDOWN|NETUP          close/reopen the HOST network backend
                                        (checkpoint support; not a streamhost verb)
       ->  <seq> KEY <0|1> <port> <field>
@@ -147,6 +148,7 @@ const char CtlSock_fileid[] = "Previous ctlsock.c";
 #include "screen.h"
 #include "kms.h"
 #include "ethernet.h"
+#include "screen.h"
 #include "tablet.h"
 #include "ctlsock.h"
 
@@ -160,7 +162,8 @@ enum {
 	CTL_KEY,     /* a = NeXT keycode, b = down */
 	CTL_MOD,     /* a = NEXTKEY_MOD_* bit, b = down */
 	CTL_RELEASE, /* peer went away: drop everything the guest is holding */
-	CTL_NET      /* a = 1 attach the host network backend, 0 detach it */
+	CTL_NET,     /* a = 1 attach the host network backend, 0 detach it */
+	CTL_FBSYNC   /* publish the next frame WHOLE (post-checkpoint resync) */
 };
 
 struct ctl_cmd {
@@ -356,6 +359,20 @@ static const char* ctl_dispatch(uint64_t seq, char* rest) {
 			return "bad button";
 		}
 		if (!ctl_push(seq, CTL_BTN, d[0] - '0', down)) {
+			return "queue full";
+		}
+		return NULL;
+	}
+	/* FBSYNC: republish the whole framebuffer once. A criu restore leaves the
+	 * publisher's private diff shadow holding the BAKED frame while the mapping
+	 * still holds the pre-kill one, so without this the reader streams the wrong
+	 * picture forever (sdlscreen.c). streamhost never sends this; the launcher
+	 * does, once, after every restore. */
+	if (!strcmp(tok[0], "FBSYNC")) {
+		if (tok[1]) {
+			return "FBSYNC takes no argument";
+		}
+		if (!ctl_push(seq, CTL_FBSYNC, 0, 0)) {
 			return "queue full";
 		}
 		return NULL;
@@ -674,6 +691,10 @@ static void ctl_apply(const struct ctl_cmd* c) {
 				ctl_btn_left = ctl_btn_right = 0;
 				ctl_apply_buttons();
 			}
+			break;
+
+		case CTL_FBSYNC:
+			Screen_ShmResync();
 			break;
 
 		case CTL_NET:

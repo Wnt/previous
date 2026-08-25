@@ -10,6 +10,8 @@
 
 #ifdef __cplusplus
 extern "C" {
+extern void Screen_ShmResync(void);
+
 #endif /* __cplusplus */
 
 extern volatile bool bGrabMouse;
@@ -32,6 +34,7 @@ extern void Screen_StatusbarUpdate(void);
 extern bool Screen_ShowCursor(bool show);
 extern void Screen_CenterCursor(void);
 extern void Screen_Reset(void);
+extern void Screen_ShmResync(void);
 
 #ifdef __cplusplus
 }
