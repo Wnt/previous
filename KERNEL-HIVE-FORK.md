@@ -16,6 +16,9 @@ streamhost daemon consumes directly.
 | `sdlscreen: IFB1 shm framebuffer export` | headless capture: each changed frame published into a shared mapping in the museum's IFB1 wire format |
 | `ctlsock: mamectl/1 input control socket` | keyboard and absolute pointer injected over the wire streamhost's existing `mamesock` backend already speaks |
 | `sndfifo: raw PCM output on a named pipe` | headless audio: 48 kHz s16le stereo on a non-blocking FIFO, the daemon's `SH_AUDIO_SOURCE=fifo` contract |
+| `kms: both mouse buttons in one packet` | two back-to-back KMS reports overrun the guest's mouse driver, which discards both — the guest never saw a click |
+| `ctlsock: NETDOWN/NETUP` | criu cannot dump libpcap's `AF_PACKET` socket; the host side of the NIC has to close for the freeze |
+| `sdlscreen/ctlsock: FBSYNC` | criu carries the publisher's diff shadow but not the mapping, so a restored emulator republishes nothing and the reader streams the pre-kill picture forever |
 
 Everything is env-gated and inert when the env is unset, so the same binary
 still runs as a normal desktop Previous.
@@ -32,6 +35,12 @@ still runs as a normal desktop Previous.
 | `PREVIOUS_CTL_PTR_STEP` / `_RATE` / `_SETTLE` | kms-route pacing (see below) | — |
 | `PREVIOUS_CTL_BTN_HOLD` | minimum button-down time, ms (default 400) | — |
 | `PREVIOUS_AUDIO_FIFO=<path>` | raw PCM output | `SH_AUDIO_SOURCE=fifo`, `SH_AUDIO_FIFO=<same>` |
+
+Three verbs exist for the CHECKPOINT tooling and are never sent by streamhost:
+`NETDOWN` / `NETUP` close and reopen the host side of the emulated NIC with the
+guest's own NIC state untouched, and `FBSYNC` republishes one whole frame. See
+**Checkpointing**, below — each of them closes a failure that passes a smoke
+test while being broken.
 
 `SH_MAMESOCK_PTR_GRID` stays **unset**: this server states targets in screen
 pixels, which is what the grid-less path already sends.
@@ -128,8 +137,25 @@ Dump and restore work with all three planes open. Measured on the bring-up rig:
 reflink-paired before the dump. After restore the process is still in its
 job-control stop: **`kill -CONT` it**.
 
-One constraint the control socket adds: a dump succeeds with the socket
-LISTENING but fails while a client is CONNECTED (`unix: Unix socket … not
-found`), and `--ext-unix-sk` does not rescue it. Take checkpoints with no
-client attached; the daemon's `mamesock` sink already reconnects forever with
-backoff, so a restore simply gets reconnected.
+Four constraints, each found the hard way on the museum's `nextstep` station:
+
+* **No connected client.** A dump succeeds with the socket LISTENING and fails
+  while a client is CONNECTED (`unix: Unix socket … not found`);
+  `--ext-unix-sk` does not rescue it. `mamesock` reconnects forever with
+  backoff, so a restore simply gets reconnected.
+* **No character-device fds.** SDL's dummy video driver still opens
+  `/dev/input/event*`, and criu cannot dump those (`Can't dump file … (chr
+  13/65)`). Run the emulator as an account outside the `input` group; the nodes
+  are then simply unopenable and the problem disappears.
+* **No open `AF_PACKET` socket.** libpcap's socket answers EOPNOTSUPP to
+  `getsockopt(SOL_SOCKET, SO_PASSCRED)` and criu aborts. Say `NETDOWN` before
+  the dump and `NETUP` after the restore.
+* **Republish the framebuffer.** criu carries the publisher's private diff
+  shadow but not the mapping, so a restored emulator believes the reader is
+  already up to date and publishes nothing — the reader streams the pre-kill
+  picture forever. Say `FBSYNC` after every restore.
+
+A bridged guest also needs its veth dumped as `--external veth[inner]:outer`, or
+the restore dies on `Unknown peer net namespace`; criu then deletes and
+re-creates the pair, so the host end comes back bare and its addressing, bridge
+port and firewall rules have to be re-applied after every restore.
