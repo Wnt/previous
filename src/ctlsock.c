@@ -118,8 +118,26 @@
 
   Nothing here is guessed at run time: a `port`/`field` this server does not
   recognise is answered ERR and the key is dropped, never folded onto a
-  neighbour. Hold timing is the browser's, exactly as on the QEMU stations - the
-  guest generates its own auto-repeat from the held state.
+  neighbour.
+
+  KEY DWELL FLOORS. Hold timing is NOT simply the browser's. The KMS is a serial
+  device with a one-report register: a second report landing before the guest has
+  read the first raises KM_OVERRUN and NeXTSTEP discards the pair (kms.c). A
+  phone's soft keyboard stamps a press and its release with the SAME millisecond,
+  the daemon's writer drains its queue without waiting for acks, and both edges
+  then land in one drain pass microseconds apart - which is why a visitor typing
+  on a phone saw roughly one character in ten. So this server holds an edge at
+  the queue head until two floors are met, in strict arrival order:
+
+      PREVIOUS_CTL_KEY_HOLD  ms a key stays down before its OWN release (40)
+      PREVIOUS_CTL_KEY_GAP   ms between consecutive KMS keyboard reports (40)
+
+  Both default to the daemon's own SH_KEY_MIN_HOLD_MS/SH_KEY_MIN_GAP_MS values;
+  its gate does not run on this backend. 0 disables either floor. A visitor who
+  really holds a key pays nothing, and the guest still generates its own
+  auto-repeat from the held state. Modifiers are LEVELS and are paced as reports
+  but never reordered, so a deferred key edge carries exactly the mask that was
+  in force when it arrived.
 
 
   THREADING. One reader thread owns the socket and does nothing but parse and
@@ -188,6 +206,8 @@ static int ctl_ptr_step   = 16;    /* counts per drain tick on the kms route */
 static int ctl_ptr_settle = 1200;  /* ms a button edge waits for convergence */
 static int ctl_ptr_rate   = 0;     /* min ms between kms reports, 0 = every tick */
 static int ctl_btn_hold   = 400;   /* min ms a button stays down before release */
+static int ctl_key_hold   = 40;    /* min ms a key stays down before its release */
+static int ctl_key_gap    = 40;    /* min ms between consecutive KMS keyboard reports */
 
 /* ------------------------------------------------------------------ state */
 
@@ -208,6 +228,9 @@ static int     ctl_home_left;            /* homing slams still to send */
 static uint64_t ctl_wait_since;          /* ms an edge has been waiting */
 static uint64_t ctl_last_report;         /* ms of the last kms mouse report */
 static uint64_t ctl_btn_down_at[4];      /* ms a button went down, by number */
+static uint64_t ctl_key_down_at[256];    /* ms a NeXT keycode went down */
+static uint64_t ctl_mod_down_at[8];      /* ms a modifier bit went down, by bit */
+static uint64_t ctl_key_last;            /* ms the last KMS keyboard report was APPLIED */
 static int      ctl_route = -1;          /* last route reported, for the log */
 static uint64_t ctl_acks_dropped;
 
@@ -550,6 +573,17 @@ static int ctl_clampi(int v, int lo, int hi) {
 	return v < lo ? lo : (v > hi ? hi : v);
 }
 
+/* Index of a single NEXTKEY_MOD_* bit, for the per-modifier dwell table. */
+static int ctl_mod_index(uint8_t bit) {
+	int i;
+	for (i = 0; i < 8; i++) {
+		if (bit & (1u << i)) {
+			return i;
+		}
+	}
+	return 0;
+}
+
 static void ctl_apply_buttons(void) {
 	if (ctl_use_tablet()) {
 		tablet_pen_button(1, ctl_btn_left);
@@ -662,10 +696,13 @@ static void ctl_apply(const struct ctl_cmd* c) {
 
 		case CTL_KEY:
 			if (c->b) {
+				ctl_key_down_at[c->a & 0xFF] = SDL_GetTicks();
 				kms_keydown(ctl_mods, (uint8_t)c->a);
 			} else {
+				ctl_key_down_at[c->a & 0xFF] = 0;
 				kms_keyup(ctl_mods, (uint8_t)c->a);
 			}
+			ctl_key_last = SDL_GetTicks();
 			break;
 
 		case CTL_MOD:
@@ -674,18 +711,24 @@ static void ctl_apply(const struct ctl_cmd* c) {
 			 * the up, exactly as SDL's own modifier state does in
 			 * sdlkeymap.c. The keycode is NONE - a modifier is not a key. */
 			if (c->b) {
+				ctl_mod_down_at[ctl_mod_index((uint8_t)c->a)] = SDL_GetTicks();
 				ctl_mods |= (uint8_t)c->a;
 				kms_keydown(ctl_mods, NEXTKEY_NONE);
 			} else {
+				ctl_mod_down_at[ctl_mod_index((uint8_t)c->a)] = 0;
 				ctl_mods &= (uint8_t)~c->a;
 				kms_keyup(ctl_mods, NEXTKEY_NONE);
 			}
+			ctl_key_last = SDL_GetTicks();
 			break;
 
 		case CTL_RELEASE:
+			memset(ctl_key_down_at, 0, sizeof(ctl_key_down_at));
+			memset(ctl_mod_down_at, 0, sizeof(ctl_mod_down_at));
 			if (ctl_mods) {
 				ctl_mods = 0;
 				kms_keyup(0, NEXTKEY_NONE);
+				ctl_key_last = SDL_GetTicks();
 			}
 			if (ctl_btn_left || ctl_btn_right) {
 				ctl_btn_left = ctl_btn_right = 0;
@@ -738,6 +781,63 @@ void CtlSock_Drain(void) {
 		 * The browser sends a visitor's real edges, and a quick click is a
 		 * quick click, so the floor belongs here, at the injector, exactly
 		 * like MAME's MAME_CTL_KEY_EXCL. PREVIOUS_CTL_BTN_HOLD=0 disables it. */
+		/* PACE THE KEYBOARD, for the same reason the buttons are paced and by
+		 * the same mechanism.
+		 *
+		 * The NeXT keyboard is a SERIAL device behind a ONE-REPORT register.
+		 * kms_km_receive() (kms.c) writes each report into `kms.kmdata` and
+		 * raises KM_OVERRUN if the guest has not read the previous one yet --
+		 * and NeXTSTEP's driver discards the pair when it sees that bit. Two
+		 * reports applied in the SAME drain pass are microseconds apart, so the
+		 * first is always lost. This is the keyboard's half of the two-packet
+		 * mouse-button bug the same campaign found (kms_mouse_buttons()).
+		 *
+		 * It bites because a browser is not a keyboard. A soft keyboard on a
+		 * phone stamps the press and the release with the SAME millisecond
+		 * (measured on the live station, serve/clientlog.jsonl 2026-08-25:
+		 * `d,...,1787632819332,2d;u,...,1787632819332,2d`), the daemon's
+		 * mamesock writer drains its queue without waiting for acks, and both
+		 * edges land in one CtlSock_Drain(). Measured on the rig, typing
+		 * "the quick brown fox" as pipelined edges:
+		 *
+		 *     hold 0 ms   0/19 characters      gap 0 ms    1/19
+		 *     hold 1 ms   5/19                 gap 2 ms   lossy
+		 *     hold 3 ms  14/19                 gap 5 ms   18/19
+		 *     hold 5 ms  19/19, but 8 ms 17/19 (the 200 Hz drain jitters)
+		 *     hold 12 ms and up  19/19         gap 8 ms and up  19/19
+		 *
+		 * so BOTH dwells are real and the clean point is ~12 ms on an idle rig.
+		 * The floors below carry 3x margin over that, and match the daemon's own
+		 * SH_KEY_MIN_HOLD_MS/SH_KEY_MIN_GAP_MS defaults on the QEMU fleet -- a
+		 * gate that does NOT run on this backend (mame_sock.rs), which is why
+		 * every host-native conversion has had to pace inside the emulator.
+		 *
+		 * ARRIVAL ORDER IS NEVER BROKEN: only the queue HEAD is examined, and a
+		 * held edge simply comes back next tick. That is also what keeps the
+		 * modifier mask honest -- `mod` edges are levels, applied in order like
+		 * everything else, so a deferred key edge picks up exactly the mask that
+		 * was in force when it arrived. A real hold pays nothing: a visitor who
+		 * holds a key for 80 ms has already satisfied both floors. */
+		if ((c.verb == CTL_KEY || c.verb == CTL_MOD) && ctl_key_gap > 0 &&
+		    ctl_key_last != 0 && SDL_GetTicks() - ctl_key_last < (uint64_t)ctl_key_gap) {
+			break;   /* come back next tick; the queue keeps its order */
+		}
+		/* A release waits for its OWN press, not for the last edge on the wire:
+		 * in a rollover burst (B pressed before A is released) the two keys
+		 * interleave, and a shared timer would let A's release ride out on B's
+		 * press. */
+		if (c.verb == CTL_KEY && !c.b && ctl_key_hold > 0) {
+			uint64_t down = ctl_key_down_at[c.a & 0xFF];
+			if (down != 0 && SDL_GetTicks() - down < (uint64_t)ctl_key_hold) {
+				break;
+			}
+		}
+		if (c.verb == CTL_MOD && !c.b && ctl_key_hold > 0) {
+			uint64_t down = ctl_mod_down_at[ctl_mod_index((uint8_t)c.a)];
+			if (down != 0 && SDL_GetTicks() - down < (uint64_t)ctl_key_hold) {
+				break;
+			}
+		}
 		if (c.verb == CTL_BTN && !c.b && c.a >= 1 && c.a <= 3 && ctl_btn_hold > 0) {
 			uint64_t down = ctl_btn_down_at[c.a];
 			uint64_t now  = SDL_GetTicks();
@@ -805,6 +905,8 @@ void CtlSock_Init(void) {
 	ctl_ptr_settle = ctl_env_int("PREVIOUS_CTL_PTR_SETTLE", 1200, 0, 60000);
 	ctl_ptr_rate   = ctl_env_int("PREVIOUS_CTL_PTR_RATE", 0, 0, 1000);
 	ctl_btn_hold   = ctl_env_int("PREVIOUS_CTL_BTN_HOLD", 400, 0, 5000);
+	ctl_key_hold   = ctl_env_int("PREVIOUS_CTL_KEY_HOLD", 40, 0, 1000);
+	ctl_key_gap    = ctl_env_int("PREVIOUS_CTL_KEY_GAP",  40, 0, 1000);
 
 	snprintf(ctl_path, sizeof(ctl_path), "%s", path);
 	/* A stale socket file from a previous run of THIS station is ours to
@@ -837,10 +939,11 @@ void CtlSock_Init(void) {
 		return;
 	}
 	fprintf(stderr, "ctlsock: mamectl/1 on %s (pointer %s, step %d, rate %d ms, "
-	        "settle %d ms, button hold %d ms)\n",
+	        "settle %d ms, button hold %d ms, key hold %d ms, key gap %d ms)\n",
 	        ctl_path,
 	        ctl_ptr_mode == PTR_TABLET ? "tablet" : (ctl_ptr_mode == PTR_KMS ? "kms" : "auto"),
-	        ctl_ptr_step, ctl_ptr_rate, ctl_ptr_settle, ctl_btn_hold);
+	        ctl_ptr_step, ctl_ptr_rate, ctl_ptr_settle, ctl_btn_hold,
+	        ctl_key_hold, ctl_key_gap);
 }
 
 void CtlSock_UnInit(void) {
