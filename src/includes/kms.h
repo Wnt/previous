@@ -104,6 +104,7 @@ extern void kms_keydown(uint8_t modkeys, uint8_t keycode);
 extern void kms_keyup(uint8_t modkeys, uint8_t keycode);
 extern void kms_mouse_move(int x, int y);
 extern void kms_mouse_button(bool left, bool down);
+extern void kms_mouse_buttons(bool left_down, bool right_down);
 
 extern bool kms_send_codec_receive(uint32_t data);
 extern bool kms_can_receive_codec(void);

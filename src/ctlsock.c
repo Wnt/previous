@@ -521,8 +521,9 @@ static void ctl_apply_buttons(void) {
 		tablet_pen_button(1, ctl_btn_left);
 		tablet_pen_button(0, ctl_btn_right);
 	} else {
-		kms_mouse_button(true,  ctl_btn_left  ? true : false);
-		kms_mouse_button(false, ctl_btn_right ? true : false);
+		/* ONE report for the pair: two back-to-back KMS packets overrun the
+		 * guest's mouse driver and both are discarded (kms.c). */
+		kms_mouse_buttons(ctl_btn_left ? true : false, ctl_btn_right ? true : false);
 	}
 }
 

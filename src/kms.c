@@ -434,6 +434,31 @@ void kms_mouse_button(bool left, bool down) {
     km_internal_poll(addr);
 }
 
+/* Both buttons in ONE report.
+ *
+ * kms_mouse_button() sends a packet per button, so setting the pair - which is
+ * what an injector with a full button mask does - puts two reports into the
+ * KMS back to back. The second lands before the guest has read the first,
+ * kms_km_receive() raises KM_OVERRUN, and NeXTSTEP's mouse driver discards the
+ * pair: measured on a colour NeXTstation, a held left button produced no
+ * highlight, no menu track and no rubber band, while motion through the very
+ * same path worked perfectly (one report per move). A real NeXT mouse reports
+ * both buttons in the single byte pair this builds. */
+void kms_mouse_buttons(bool left_down, bool right_down) {
+    uint8_t  addr = kms.km_addr|KM_MOUSE;
+    uint16_t data = 0;
+
+    m_button_left  = left_down;
+    m_button_right = right_down;
+
+    data |= m_button_left?0:MOUSE_LEFT_UP;
+    data |= m_button_right?0:MOUSE_RIGHT_UP;
+
+    kms.km_data[addr&KM_ADDR_MASK] = data;
+
+    km_internal_poll(addr);
+}
+
 void kms_mouse_move(int x, int y) {
     bool move_right, move_down;
     uint8_t  addr = kms.km_addr|KM_MOUSE;
