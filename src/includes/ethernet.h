@@ -52,6 +52,8 @@ extern EthernetBuffer enet_rx_buffer;
 extern void Ethernet_IO_Handler(void);
 extern void Ethernet_Reset(bool hard);
 extern void Ethernet_UnInit(void);
+extern void Ethernet_HostDetach(void);
+extern void Ethernet_HostAttach(void);
 extern void enet_receive(uint8_t *pkt, int len);
 
 /* Turbo ethernet controller */

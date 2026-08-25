@@ -744,6 +744,32 @@ void Ethernet_IO_Handler(void) {
     CycInt_UpdateTimeEvent(receiver_state==RECV_STATE_WAITING?ENET_IO_DELAY:ENET_IO_SHORT, 0, EVENT_ETHERNET_IO);
 }
 
+/* Host-side backend detach/attach, with the EMULATED NIC untouched.
+ *
+ * This exists for ONE reason: criu cannot dump libpcap's AF_PACKET socket.
+ * `getsockopt(SOL_SOCKET, SO_PASSCRED)` on it answers EOPNOTSUPP and criu
+ * aborts the whole dump (`sockets.c:628 Can't get 1:16 opt`), so a station that
+ * is both on the retronet AND checkpointed has to close that socket for the
+ * length of the freeze. Nothing about the GUEST changes: enet.mac_addr, the
+ * transmitter/receiver state and every buffer live in emulated memory, which is
+ * exactly what the checkpoint carries. The link is simply silent while the
+ * backend is down, the way an unplugged cable is.
+ *
+ * Both are idempotent: enet_pcap_start/stop and their SLIRP twins guard on
+ * their own started flag, and a machine with no backend configured does
+ * nothing at all. */
+void Ethernet_HostDetach(void) {
+    if (ConfigureParams.Ethernet.bEthernetConnected && enet_stop) {
+        enet_stop();
+    }
+}
+
+void Ethernet_HostAttach(void) {
+    if (ConfigureParams.Ethernet.bEthernetConnected && enet_start) {
+        enet_start(enet.mac_addr);
+    }
+}
+
 void enet_reset(void) {
     if (enet.reset&EN_RESET) {
         enet.tx_status=ConfigureParams.System.bTurbo?0:TXSTAT_READY;
