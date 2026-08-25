@@ -88,6 +88,47 @@
   guests. A RELEASE arriving early waits in the queue, in order, until
   PREVIOUS_CTL_BTN_HOLD ms have passed since its press (default 400, 0 = off).
 
+  BUTTON GAP FLOOR, and why the hold alone was never enough. A button edge is a
+  REPORT on a serial device, exactly like a key edge, and the device holds one
+  report at a time on BOTH routes:
+
+    * tablet route - summa_pen_button() calls summa_send_state(), which calls
+      tablet_send_data(5): that assigns tablet.count and schedules EVENT_TABLET_IO
+      to shift the packet out one byte per 1000 CPU cycles. Two calls in one
+      CtlSock_Drain() pass are microseconds apart with NO emulated cycles in
+      between, so the second REWRITES tablet.data and resets tablet.count before
+      a single byte of the first has gone out. The first report is not truncated;
+      it is never transmitted at all. tablet.flags is a level, so what the guest
+      receives is one packet carrying the LATEST state.
+    * kms route - kms_mouse_buttons() is one KMS report, and kms_km_receive()
+      raises KM_OVERRUN when the guest has not read the previous one.
+
+  The hold made a DOUBLE CLICK fail deterministically. The release of the first
+  click waits out PREVIOUS_CTL_BTN_HOLD at the queue head; when it finally
+  applies, the drain loop takes the very next entry - the second PRESS - in the
+  SAME pass. The release is destroyed, the guest sees one long press, and
+  NeXTSTEP scores a select, not an open (measured on a rig, 2026-08-25: a
+  pipelined DOWN1 UP1 DOWN1 UP1 SELECTED OmniWeb.app and never launched it,
+  while an ACKING client - which cannot put two edges in one pass - launched it
+  from the same pixel).
+
+      PREVIOUS_CTL_BTN_GAP   ms between consecutive button reports (default 40)
+
+  The gap is shared with the keyboard's: on the kms route the two verbs are
+  literally the same one-report register, and 40 ms between a key and a click is
+  free for any human. It is also a CEILING on the double click, because the
+  guest's own threshold measures PRESS TO PRESS, and a pipelined double click
+  costs exactly PREVIOUS_CTL_BTN_HOLD + PREVIOUS_CTL_BTN_GAP. Swept on the rig
+  against NeXTSTEP 3.3's own verdict (does a click pair in a text field select
+  the word?):
+
+      240 260 320 380 440 ms press to press   DOUBLE
+      450 460 470 480 490 500 600 ms          two singles
+
+  so the guest's threshold is between 440 and 450 ms, and the station's
+  200 + 40 = 240 ms leaves 200 ms of margin. Raising either floor eats that
+  margin directly.
+
 
   KEYBOARD: the NeXT KMS scancode space, plus a modifier MASK.
   -----------------------------------------------------------
@@ -206,6 +247,7 @@ static int ctl_ptr_step   = 16;    /* counts per drain tick on the kms route */
 static int ctl_ptr_settle = 1200;  /* ms a button edge waits for convergence */
 static int ctl_ptr_rate   = 0;     /* min ms between kms reports, 0 = every tick */
 static int ctl_btn_hold   = 400;   /* min ms a button stays down before release */
+static int ctl_btn_gap    = 40;    /* min ms between consecutive button reports */
 static int ctl_key_hold   = 40;    /* min ms a key stays down before its release */
 static int ctl_key_gap    = 40;    /* min ms between consecutive KMS keyboard reports */
 
@@ -230,7 +272,11 @@ static uint64_t ctl_last_report;         /* ms of the last kms mouse report */
 static uint64_t ctl_btn_down_at[4];      /* ms a button went down, by number */
 static uint64_t ctl_key_down_at[256];    /* ms a NeXT keycode went down */
 static uint64_t ctl_mod_down_at[8];      /* ms a modifier bit went down, by bit */
-static uint64_t ctl_key_last;            /* ms the last KMS keyboard report was APPLIED */
+/* ms the last INPUT REPORT of any kind (key, modifier or button) was applied.
+ * One timestamp for all three on purpose: on the kms pointer route they are the
+ * same one-report register, and on the tablet route the 40 ms floor between a
+ * key and a click costs a human nothing. */
+static uint64_t ctl_report_last;
 static int      ctl_route = -1;          /* last route reported, for the log */
 static uint64_t ctl_acks_dropped;
 
@@ -540,6 +586,13 @@ static int SDLCALL ctl_thread_main(void* unused) {
 		SDL_SetAtomicInt(&ctl_conn_fd, -1);
 		close(fd);
 		Log_Printf(LOG_WARN, "[CtlSock] client gone; releasing held input");
+		/* Three SEPARATE reports, so the drain's floors pace them apart: both
+		 * buttons up, then the keyboard/modifier reset. Folding them into one
+		 * apply would put two reports in one pass and destroy the first — the
+		 * very bug the gap floor exists to stop. Idempotent: an UP1 for a
+		 * button that is already up restates a level and costs one packet. */
+		ctl_push(0, CTL_BTN, 1, 0);
+		ctl_push(0, CTL_BTN, 2, 0);
 		ctl_push(0, CTL_RELEASE, 0, 0);
 	}
 	return 0;
@@ -691,7 +744,14 @@ static void ctl_apply(const struct ctl_cmd* c) {
 			 * loud ERR on every reconnect. */
 			if (c->a == 1) ctl_btn_left  = c->b;
 			if (c->a == 2) ctl_btn_right = c->b;
-			if (c->a != 3) ctl_apply_buttons();
+			if (c->a != 3) {
+				ctl_apply_buttons();
+				/* A button edge IS an input report — one packet on the
+				 * tablet's serial line, one KMS report without it — so it
+				 * stamps the shared report clock the gap floor reads. A
+				 * middle-button no-op sends nothing and stamps nothing. */
+				ctl_report_last = SDL_GetTicks();
+			}
 			break;
 
 		case CTL_KEY:
@@ -702,7 +762,7 @@ static void ctl_apply(const struct ctl_cmd* c) {
 				ctl_key_down_at[c->a & 0xFF] = 0;
 				kms_keyup(ctl_mods, (uint8_t)c->a);
 			}
-			ctl_key_last = SDL_GetTicks();
+			ctl_report_last = SDL_GetTicks();
 			break;
 
 		case CTL_MOD:
@@ -719,21 +779,25 @@ static void ctl_apply(const struct ctl_cmd* c) {
 				ctl_mods &= (uint8_t)~c->a;
 				kms_keyup(ctl_mods, NEXTKEY_NONE);
 			}
-			ctl_key_last = SDL_GetTicks();
+			ctl_report_last = SDL_GetTicks();
 			break;
 
 		case CTL_RELEASE:
 			memset(ctl_key_down_at, 0, sizeof(ctl_key_down_at));
 			memset(ctl_mod_down_at, 0, sizeof(ctl_mod_down_at));
-			if (ctl_mods) {
-				ctl_mods = 0;
-				kms_keyup(0, NEXTKEY_NONE);
-				ctl_key_last = SDL_GetTicks();
-			}
-			if (ctl_btn_left || ctl_btn_right) {
-				ctl_btn_left = ctl_btn_right = 0;
-				ctl_apply_buttons();
-			}
+			/* UNCONDITIONALLY, not only when this injector believes a modifier
+			 * is held: the guest keeps its own modifier LEVEL and a synthetic
+			 * rollover burst can leave that level latched after the injector's
+			 * mask is already clean (docs/guests/nextstep.md §11). One report
+			 * on a disconnect resynchronises the guest's belief; the cost is
+			 * one KMS packet per reconnect. */
+			ctl_mods = 0;
+			kms_keyup(0, NEXTKEY_NONE);
+			ctl_report_last = SDL_GetTicks();
+			/* The buttons were released by the two CTL_BTN entries queued
+			 * ahead of this one; only the bookkeeping is left. */
+			ctl_btn_left = ctl_btn_right = 0;
+			memset(ctl_btn_down_at, 0, sizeof(ctl_btn_down_at));
 			break;
 
 		case CTL_FBSYNC:
@@ -818,8 +882,8 @@ void CtlSock_Drain(void) {
 		 * everything else, so a deferred key edge picks up exactly the mask that
 		 * was in force when it arrived. A real hold pays nothing: a visitor who
 		 * holds a key for 80 ms has already satisfied both floors. */
-		if ((c.verb == CTL_KEY || c.verb == CTL_MOD) && ctl_key_gap > 0 &&
-		    ctl_key_last != 0 && SDL_GetTicks() - ctl_key_last < (uint64_t)ctl_key_gap) {
+		if ((c.verb == CTL_KEY || c.verb == CTL_MOD || c.verb == CTL_RELEASE) && ctl_key_gap > 0 &&
+		    ctl_report_last != 0 && SDL_GetTicks() - ctl_report_last < (uint64_t)ctl_key_gap) {
 			break;   /* come back next tick; the queue keeps its order */
 		}
 		/* A release waits for its OWN press, not for the last edge on the wire:
@@ -837,6 +901,18 @@ void CtlSock_Drain(void) {
 			if (down != 0 && SDL_GetTicks() - down < (uint64_t)ctl_key_hold) {
 				break;
 			}
+		}
+		/* THE GAP THAT MAKES A DOUBLE CLICK POSSIBLE. Without it the first
+		 * click's release — which has just waited out PREVIOUS_CTL_BTN_HOLD at
+		 * this very queue head — and the second click's press are applied in
+		 * ONE drain pass, the release's report is overwritten before a byte of
+		 * it leaves the device, and the guest sees a single long press: a
+		 * select, never an open. Same floor, same reason and (on the kms route)
+		 * the same register as the keyboard's, so it reads the same clock.
+		 * Middle button is a no-op that sends no report and waits for none. */
+		if (c.verb == CTL_BTN && c.a != 3 && ctl_btn_gap > 0 &&
+		    ctl_report_last != 0 && SDL_GetTicks() - ctl_report_last < (uint64_t)ctl_btn_gap) {
+			break;   /* come back next tick; the queue keeps its order */
 		}
 		if (c.verb == CTL_BTN && !c.b && c.a >= 1 && c.a <= 3 && ctl_btn_hold > 0) {
 			uint64_t down = ctl_btn_down_at[c.a];
@@ -905,6 +981,7 @@ void CtlSock_Init(void) {
 	ctl_ptr_settle = ctl_env_int("PREVIOUS_CTL_PTR_SETTLE", 1200, 0, 60000);
 	ctl_ptr_rate   = ctl_env_int("PREVIOUS_CTL_PTR_RATE", 0, 0, 1000);
 	ctl_btn_hold   = ctl_env_int("PREVIOUS_CTL_BTN_HOLD", 400, 0, 5000);
+	ctl_btn_gap    = ctl_env_int("PREVIOUS_CTL_BTN_GAP",   40, 0, 1000);
 	ctl_key_hold   = ctl_env_int("PREVIOUS_CTL_KEY_HOLD", 40, 0, 1000);
 	ctl_key_gap    = ctl_env_int("PREVIOUS_CTL_KEY_GAP",  40, 0, 1000);
 
@@ -939,10 +1016,11 @@ void CtlSock_Init(void) {
 		return;
 	}
 	fprintf(stderr, "ctlsock: mamectl/1 on %s (pointer %s, step %d, rate %d ms, "
-	        "settle %d ms, button hold %d ms, key hold %d ms, key gap %d ms)\n",
+	        "settle %d ms, button hold %d ms, button gap %d ms, key hold %d ms, "
+	        "key gap %d ms)\n",
 	        ctl_path,
 	        ctl_ptr_mode == PTR_TABLET ? "tablet" : (ctl_ptr_mode == PTR_KMS ? "kms" : "auto"),
-	        ctl_ptr_step, ctl_ptr_rate, ctl_ptr_settle, ctl_btn_hold,
+	        ctl_ptr_step, ctl_ptr_rate, ctl_ptr_settle, ctl_btn_hold, ctl_btn_gap,
 	        ctl_key_hold, ctl_key_gap);
 }
 

@@ -117,6 +117,33 @@ the floor lives here at the injector, the way `MAME_CTL_KEY_EXCL` serialises
 keys for the matrix guests: an early RELEASE waits in the queue, in order, until
 `PREVIOUS_CTL_BTN_HOLD` ms have passed since its press.
 
+**And a minimum GAP, which is what made a double click work at all.** A button
+edge is a REPORT on a serial device exactly like a key edge, and the hold alone
+guaranteed the worst case: the first click's release waits out the hold at the
+queue head, and when it finally applies the drain loop takes the SECOND PRESS in
+the same pass. On the tablet route `summa_send_state()` calls
+`tablet_send_data(5)`, which just assigns `tablet.count` and schedules
+`EVENT_TABLET_IO`; two calls in one pass are microseconds apart with no emulated
+cycles between them, so the second rewrites the buffer before one byte of the
+first has gone out and the release is never transmitted at all. (On the kms
+route it is `KM_OVERRUN`, the same register as the keyboard's.) The guest sees
+one long press: NeXTSTEP SELECTS an icon and never opens it, places a caret and
+never selects the word — which is precisely what the museum's visitors got.
+Measured on a rig, 2026-08-25: a pipelined `DOWN1 UP1 DOWN1 UP1` selected
+`OmniWeb.app` and never launched it, while an ACKING client — which cannot put
+two edges in one pass, and which is why the control-socket tests never saw this
+— launched it from the same pixel.
+
+`PREVIOUS_CTL_BTN_GAP` (default 40 ms) holds a button edge at the queue head
+until that long after the last report of ANY kind. It shares the keyboard's
+clock because on the kms route it is the same one-report register. It is also a
+CEILING: the guest scores a double click PRESS TO PRESS, and a pipelined pair
+costs `BTN_HOLD + BTN_GAP`. Swept against NeXTSTEP 3.3's own verdict (does a
+click pair select a word in a text field?), 240/260/320/380/440 ms all scored
+DOUBLE and 450/460/470/480/490/500/600 ms all scored two singles — so the
+guest's threshold is between **440 and 450 ms**, and the station's 200 + 40 =
+240 ms leaves 200 ms of margin.
+
 **So does the keyboard, for a harder reason.** The KMS is a serial device behind
 a ONE-REPORT register: `kms_km_receive()` overwrites `kms.kmdata` and raises
 `KM_OVERRUN` when a second report arrives before the guest has read the first,
@@ -135,7 +162,12 @@ measured floor, and the same numbers as the daemon's `SH_KEY_MIN_*` gate, which
 does not run on this backend. Both floors are applied at the queue HEAD only, so
 arrival order survives; a release waits for its OWN press, so a rollover burst
 cannot let one key's release ride out on another's press; and modifiers stay
-levels, paced but never reordered.
+levels, paced but never reordered. A disconnect (`CTL_RELEASE`) now queues both
+buttons up and the modifier reset as THREE separate entries, so the same floors
+pace them apart instead of stacking three reports into one apply, and it sends
+`kms_keyup(0, NEXTKEY_NONE)` unconditionally — the guest keeps its own modifier
+LEVEL, and a synthetic rollover burst can leave that level latched after the
+injector's own mask is already clean.
 
 ### Audio
 
