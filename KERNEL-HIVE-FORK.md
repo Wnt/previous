@@ -34,6 +34,7 @@ still runs as a normal desktop Previous.
 | `PREVIOUS_CTL_PTR=auto\|tablet\|kms` | pointer route (default `auto`) | — |
 | `PREVIOUS_CTL_PTR_STEP` / `_RATE` / `_SETTLE` | kms-route pacing (see below) | — |
 | `PREVIOUS_CTL_BTN_HOLD` | minimum button-down time, ms (default 400) | — |
+| `PREVIOUS_CTL_KEY_HOLD` / `_GAP` | minimum key-down time and minimum time between KMS keyboard reports, ms (default 40 each) | — |
 | `PREVIOUS_AUDIO_FIFO=<path>` | raw PCM output | `SH_AUDIO_SOURCE=fifo`, `SH_AUDIO_FIFO=<same>` |
 
 Three verbs exist for the CHECKPOINT tooling and are never sent by streamhost:
@@ -115,6 +116,26 @@ browser forwards a visitor's real edges and a quick click is a quick click, so
 the floor lives here at the injector, the way `MAME_CTL_KEY_EXCL` serialises
 keys for the matrix guests: an early RELEASE waits in the queue, in order, until
 `PREVIOUS_CTL_BTN_HOLD` ms have passed since its press.
+
+**So does the keyboard, for a harder reason.** The KMS is a serial device behind
+a ONE-REPORT register: `kms_km_receive()` overwrites `kms.kmdata` and raises
+`KM_OVERRUN` when a second report arrives before the guest has read the first,
+and NeXTSTEP's driver discards the pair. Two edges applied in the same
+`CtlSock_Drain()` pass are microseconds apart, so the first is always lost — the
+keyboard half of the two-packet bug `kms_mouse_buttons()` closed for the mouse.
+A phone's soft keyboard stamps a press and its release with the SAME
+millisecond, and the daemon's writer drains its queue without waiting for acks,
+so both reach one drain pass; a visitor typing on a phone got about one
+character in ten while the pointer stayed perfect. Measured on a rig, typing
+"the quick brown fox" as pipelined edges: hold 0 ms lost all 19 characters,
+1 ms landed 5, 3 ms landed 14, 12 ms and up landed all 19; independently, gap
+0 ms landed 1, 5 ms landed 18, 8 ms and up all 19. `PREVIOUS_CTL_KEY_HOLD` and
+`PREVIOUS_CTL_KEY_GAP` therefore default to 40 ms each — 3x margin over the
+measured floor, and the same numbers as the daemon's `SH_KEY_MIN_*` gate, which
+does not run on this backend. Both floors are applied at the queue HEAD only, so
+arrival order survives; a release waits for its OWN press, so a rollover burst
+cannot let one key's release ride out on another's press; and modifiers stay
+levels, paced but never reordered.
 
 ### Audio
 
